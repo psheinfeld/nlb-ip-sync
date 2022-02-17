@@ -11,17 +11,18 @@ from oci.network_load_balancer import NetworkLoadBalancerClient ,NetworkLoadBala
 class ociNLB(object):
     def __init__(self,compartment_id,nlb_id,backendset_name,port):
         self.compartment_id=compartment_id
-        self.nlb_id=nlb_id
+        self.id=nlb_id
         self.backendset_name=backendset_name
         self.port=port
         self.instance_pools = []
         self.backends = {}
+        self.name=self.id + ":" + self.backendset_name + ":" + self.port 
     
     def getBackends(self):
-        log.info("Getting backends for NLB {} ".format(self.nlb_id + ":" + self.backendset_name))
+        log.info("{} - getting backends".format(self.name))
         backends_list =[]
         try:
-            list_backends_response = nlb_client.list_backends(self.nlb_id, self.backendset_name)
+            list_backends_response = nlb_client.list_backends(self.id, self.backendset_name)
             for ip_address in list_backends_response.data.items:
                 self.backends.setdefault(ip_address.ip_address,ip_address)
                 backends_list.append(ip_address.ip_address)
@@ -34,10 +35,10 @@ class ociNLB(object):
                 del self.backends[backend_ip]
 
         except Exception as e:
-            log.error("error getting backends for {} : {}".format(self.nlb_id,e))
+            log.error("{} - error getting backends : {}".format(self.id,e))
     
     def __str__(self):
-        return "id: {}, instance_pools: {}, backends: {}".format(self.nlb_id+ ":" + self.backendset_name,str(self.instance_pools),str(list(self.backends.keys())))
+        return "{} - instance_pools: {}, backends: {}".format(self.id+ ":" + self.backendset_name,str(self.instance_pools),str(list(self.backends.keys())))
         
     
     def needToSync(self):
@@ -45,12 +46,12 @@ class ociNLB(object):
         private_ip_adresses_list_for_backend = [item for sublist in private_ip_adresses_list_for_backend for item in sublist]
         #private_ip_adresses_list_for_backend = private_ip_adresses_list_for_backend.remove("")
         actual_ip_adresses_list = (list(self.backends.keys()))
-        log.info("backends in pools ({}) : {}".format(len(private_ip_adresses_list_for_backend),private_ip_adresses_list_for_backend))
-        log.info("backends registered ({}) : {}".format(len(actual_ip_adresses_list),actual_ip_adresses_list))
+        log.info("{} - backends in pools ({}) : {}".format(self.name, len(private_ip_adresses_list_for_backend),private_ip_adresses_list_for_backend))
+        log.info("{} - backends registered ({}) : {}".format(self.name,len(actual_ip_adresses_list),actual_ip_adresses_list))
         if (collections.Counter(private_ip_adresses_list_for_backend)==collections.Counter(actual_ip_adresses_list)):
-            log.info("NLB {} is SYNCED".format(self.nlb_id))
+            log.info("{} - SYNCED".format(self.name))
             return False
-        log.info("NLB {} is NOT_SYNCED".format(self.nlb_id))
+        log.info("{} - NOT_SYNCED".format(self.name))
         return True
 
 
@@ -63,42 +64,43 @@ class ociNLB(object):
         backendSetDetails = {"backends":[]}
         for private_ip in private_ip_list_for_backend:
             backendSetDetails["backends"].append({"port": self.port,"targetId":private_ip})
-        log.info("backendSetDetails : {}".format(str(backendSetDetails)))
-        log.info("Starting NLB {} update".format(self.nlb_id))
-        composite_virtual_network_client.update_backend_set_and_wait_for_state(self.nlb_id,backendSetDetails, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"])
-        log.info("Finished NLB {} update".format(self.nlb_id))
+        log.info("{} - backendSetDetails : {}".format(self.name, str(backendSetDetails)))
+        log.info("{} - starting update".format(self.name))
+        composite_virtual_network_client.update_backend_set_and_wait_for_state(self.id,backendSetDetails, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"])
+        log.info("{} - finished update".format(self.name))
 
 
 class ociInstancePool(object):
-    def __init__(self,instance_pool_id,compartment_id):
+    def __init__(self,id,compartment_id):
         self.compartment_id=compartment_id
-        self.instance_pool_id=instance_pool_id
+        self.id=id
         self.instances = {}
         
     
     def __str__(self):
-        return self.instance_pool_id + " : " +  str(list(self.instances.keys()))
+        return self.id + " : " +  str(list(self.instances.keys()))
     
     def full(self):
-        output = self.instance_pool_id + " : \n"
+        output =  "{} - ({}) ".format(self.id, len(self.instances.keys()) )
         for instance in self.instances.values():
-            output = output + str(instance) + "\n" 
+            output = output + str(instance) 
         return output
 
     def getInstances(self):
 
-        log.info("Getting instances for IP {} ".format(self.instance_pool_id))
+        log.info("{} - getting instances".format(self.id))
 
         #get instances for instance pool
+
         instances_list = []
         try:
-            list_instance_pool_instances_response = compute_management_client.list_instance_pool_instances(self.compartment_id, self.instance_pool_id)
+            list_instance_pool_instances_response = compute_management_client.list_instance_pool_instances(self.compartment_id, self.id)
             for instance in list_instance_pool_instances_response.data:
                 if instance.state == "Running":
-                    self.instances.setdefault(instance.id,ociInstance(instance.id))
+                    self.instances.setdefault(instance.id,ociInstance(instance.id,instance))
                     instances_list.append(instance.id)
         except Exception as e:
-            log.error("error getting instances for {} : {}".format(self.instance_pool_id,e))
+            log.error("{} - error getting instances : {}".format(self.id,e))
         
         #remove terminated
         remove_list = []
@@ -110,56 +112,65 @@ class ociInstancePool(object):
 
         #instance-> attachment-> ip
         for instance in self.instances.values():
-            if not instance.net_info_filled:
-                vNIC_attachments.add_compartment(self.compartment_id)
+            if not instance.net_info_filled():
+                vNIC_attachments.add_compartment(instance.instance.compartment_id)
                 vnic_attachment = vNIC_attachments.get_vnic_attachment_by_compartment_id_and_instance_id(self.compartment_id,instance.id)
                 if vnic_attachment:
                     instance.add_vnic_attachment(vnic_attachment)
                 else:
-                    log.warning("no vNIC attachment for instance {} ".format(instance.id))
+                    log.error("{} - no vNIC attachment found".format(instance.id))
     
     def getPrivateIPs(self):
-        return [instance.privateip_id for instance in self.instances.values()]
+        return [instance.privateip_id() for instance in self.instances.values()]
     
     def getPrivateIPAddresses(self):
-        return [instance.ip_address for instance in self.instances.values()]
+        return [instance.ip_address() for instance in self.instances.values()]
 
 class ociInstance(object):
-    def __init__(self,id=None, instance=None,vnic_attachment=None,vnic=None,privateip=None):
-        self.id = id
+    def __init__(self,instance_id=None, instance=None,vnic_attachment=None,vnic=None,privateip=None):
+        self.id = instance_id
         self.instance = instance
         self.vnic_attachment = vnic_attachment
         self.vnic = vnic
         self.privateip = privateip
-        self.privateip_id = ""
-        self.ip_address = ""
-        self.net_info_filled = False
+        self._privateip_id = ""
+        self._ip_address = ""
     
     def add_vnic_attachment(self,vnic_attachment):
         self.vnic_attachment = vnic_attachment
         self.update_network_information()
 
     def update_network_information(self):
-        if not self.vnic_attachment:
+        if self.net_info_filled():
             return
+
         try:
             self.vnic = virtual_network_client.get_vnic(self.vnic_attachment.vnic_id).data
-            self.ip_address = self.vnic.private_ip
+            print("setting ip: {}".format(self.vnic.private_ip))
+            self._ip_address = self.vnic.private_ip
         except Exception as e:
-            log.error("error geting vnic for {} : {}".format(self.id, e))
+            log.error("{} - error geting vnic: {}".format(self.id, e))
             return
         
         try:
             self.privateip = virtual_network_client.list_private_ips( vnic_id=self.vnic.id).data[0]
-            self.privateip_id = self.privateip.id
-            self.net_info_filled = True
+            self._privateip_id = self.privateip.id
         except Exception as e:
-            log.error("error geting privateip for {} : {}".format(self.id, e))
-        
-        
+            log.error("{} - error geting privateip: {}".format(self.id, e))
+
+    def privateip_id(self):
+        return self._privateip_id
+    
+    def ip_address(self):
+        return self._ip_address
+    
+    def net_info_filled(self):
+        if self._privateip_id != "" and self._ip_address != "":
+            return True
+        return False
 
     def __str__(self):
-        return self.id + " " + str(self.privateip.id)+ " " + str(self.ip_address) #instance.display_name + " " + str(self.id)
+        return self.id + " " + str(self._privateip_id)+ " " + str(self._ip_address) #instance.display_name + " " + str(self.id)
     
 
 class ociVNICAttachmentPool():
@@ -173,19 +184,20 @@ class ociVNICAttachmentPool():
             self.updateVNICAttachments(compartment_id)
 
     def updateVNICAttachments(self,compartment_id=None):
-        log.info("Getting vNIC attachment information")
+        
         compartment_ids_list = [compartment_id] if compartment_id else self.compartments.keys()
         if len(compartment_ids_list) == 0:
             return
         for compartment_id in compartment_ids_list:
+            log.info("{} - getting vNIC attachments information".format(compartment_id))
             try:
                 list_vnic_attachments_response = oci.pagination.list_call_get_all_results(compute_client.list_vnic_attachments, compartment_id)
                 for vnic_attachment in list_vnic_attachments_response.data:
                     (self.compartments[compartment_id]).setdefault(vnic_attachment.instance_id,vnic_attachment)
             except Exception as e:
-                log.error("error getting vNIC attachments for compartment {} : {}".format(self.compartment_id,e))
+                log.error("{} - error getting vNIC attachments: {}".format(self.compartment_id,e))
     
-    def get_vnic_attachment_by_compartment_id_and_instance_id(self,compartment_id,instance_id):
+    def get_vnic_attachment_by_compartment_id_and_instance_id(self,compartment_id,instance_id):        
         return (self.compartments[compartment_id])[instance_id]
 
             
@@ -224,11 +236,11 @@ if __name__ == "__main__":
             nlb_id = argument[1].split(":")[0]
             backendset_name = argument[1].split(":")[1]
             port = argument[1].split(":")[2]
-            instance_pool_id = argument[2]
+            id = argument[2]
             dict_key = nlb_id + ":" + backendset_name + ":" + port
             nlb_dict.setdefault(dict_key,ociNLB(compartment_id,nlb_id,backendset_name,port))
-            ip_dict.setdefault(instance_pool_id,ociInstancePool(instance_pool_id,compartment_id))
-            sync_pairs.append((instance_pool_id,dict_key))
+            ip_dict.setdefault(id,ociInstancePool(id,compartment_id))
+            sync_pairs.append((id,dict_key))
         except Exception as e:
             log.error("arguments error : {}".format(e))
             exit()
@@ -245,7 +257,7 @@ if __name__ == "__main__":
     sync_map = list(sync_map.items())
     for item in sync_map:
         nlb_dict[item[0]].instance_pools = item[1]
-        log.info("destination : {}, source : {}".format(nlb_dict[item[0]].nlb_id,nlb_dict[item[0]].instance_pools))
+        log.info("destination : {}, source : {}".format(nlb_dict[item[0]].id,nlb_dict[item[0]].instance_pools))
 
 
     #authentication - token needs to be refreshed if not valid : signer.refresh_security_token()
