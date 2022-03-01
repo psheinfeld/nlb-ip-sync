@@ -8,6 +8,13 @@ import collections
 from oci.core import ComputeManagementClient 
 from oci.network_load_balancer import NetworkLoadBalancerClient ,NetworkLoadBalancerClientCompositeOperations
 
+MAX_BULK_SIZE = 30
+
+MAX_INTERVAL_SECONDS = 6
+
+waiter_kwargs = {"max_interval_seconds":MAX_INTERVAL_SECONDS}
+ 
+
 class ociNLB(object):
     def __init__(self,compartment_id,nlb_id,backendset_name,port):
         self.compartment_id=compartment_id
@@ -41,34 +48,93 @@ class ociNLB(object):
         return "{} - instance_pools: {}, backends: {}".format(self.id+ ":" + self.backendset_name,str(self.instance_pools),str(list(self.backends.keys())))
         
     
-    def needToSync(self):
-        private_ip_adresses_list_for_backend = [ ip_dict[instance_pool].getPrivateIPAddresses() for instance_pool in self.instance_pools ]
-        private_ip_adresses_list_for_backend = [item for sublist in private_ip_adresses_list_for_backend for item in sublist]
-        #private_ip_adresses_list_for_backend = private_ip_adresses_list_for_backend.remove("")
-        actual_ip_adresses_list = (list(self.backends.keys()))
-        log.info("{} - backends in pools ({}) : {}".format(self.name, len(private_ip_adresses_list_for_backend),private_ip_adresses_list_for_backend))
-        log.info("{} - backends registered ({}) : {}".format(self.name,len(actual_ip_adresses_list),actual_ip_adresses_list))
-        if (collections.Counter(private_ip_adresses_list_for_backend)==collections.Counter(actual_ip_adresses_list)):
-            log.info("{} - SYNCED".format(self.name))
-            return False
-        log.info("{} - NOT_SYNCED".format(self.name))
-        return True
+    def sync_state(self):
+        state = {"need_sync":False,"in_pools":[],"registered":[],"in_pools_not_registered":[],"registered_not_in_pools":[],"network_information_list":[]}
+        
+        try:
+            network_information_list_for_backend = [ ip_dict[instance_pool].network_information() for instance_pool in self.instance_pools ]
+            network_information_list_for_backend = [item for sublist in network_information_list_for_backend for item in sublist]
+            private_ip_adresses_list_for_backend = [ item["ip"] for item in network_information_list_for_backend ]
+            actual_ip_adresses_list = (list(self.backends.keys()))
 
+            in_pools_not_registered = list(set(private_ip_adresses_list_for_backend) - set(actual_ip_adresses_list))
+            registered_not_in_pools = list(set(actual_ip_adresses_list) - set(private_ip_adresses_list_for_backend))
+        
+            log.info("{} - backends in pools ({}) : {}".format(self.name, len(private_ip_adresses_list_for_backend),private_ip_adresses_list_for_backend))
+            log.info("{} - backends registered ({}) : {}".format(self.name,len(actual_ip_adresses_list),actual_ip_adresses_list))
+            log.info("{} - backends in pools not registered ({}) : {}".format(self.name,len(in_pools_not_registered),in_pools_not_registered))
+            log.info("{} - backends registered not in pools ({}) : {}".format(self.name,len(registered_not_in_pools),registered_not_in_pools))
+
+            state["in_pools"] = private_ip_adresses_list_for_backend
+            state["registered"] = actual_ip_adresses_list
+            state["in_pools_not_registered"] = in_pools_not_registered
+            state["registered_not_in_pools"] = registered_not_in_pools
+            state["network_information_list"] = network_information_list_for_backend            
+            state["need_sync"] = True if len(registered_not_in_pools)!=0 or len(in_pools_not_registered)!=0 else False
+
+        except Exception as e:
+            log.error("{} - error sync state : {}".format(self.id,e))    
+        return state
 
     def sync(self):
-        if not self.needToSync() or len(self.instance_pools) == 0 :
+        if len(self.instance_pools) == 0:
             return
-        private_ip_list_for_backend = [ ip_dict[instance_pool].getPrivateIPs() for instance_pool in self.instance_pools ]
-        private_ip_list_for_backend = [item for sublist in private_ip_list_for_backend for item in sublist]
-        #private_ip_list_for_backend = private_ip_list_for_backend.remove("")
-        backendSetDetails = {"backends":[]}
-        for private_ip in private_ip_list_for_backend:
-            backendSetDetails["backends"].append({"port": self.port,"targetId":private_ip})
-        log.info("{} - backendSetDetails : {}".format(self.name, str(backendSetDetails)))
-        log.info("{} - starting update".format(self.name))
-        composite_virtual_network_client.update_backend_set_and_wait_for_state(self.id,backendSetDetails, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"])
-        log.info("{} - finished update".format(self.name))
+        state = self.sync_state()
+        if not state["need_sync"]:
+            log.info("{} - SYNCED".format(self.name))
+            return
+        log.info("{} - NOT_SYNCED".format(self.name))
 
+        #if NLB is empty completely add , up to MAX_BULK_SIZE, instances via bulk update
+        if len(state["registered"]) == 0:
+            self.sync_full(state)
+        else:
+            self.sync_diff(state)
+
+
+    #updates whole backend set - fast but disruptive - since all nodes considered new, health check will delay actual add to operation
+    def sync_full(self,state):
+        private_ip_list_for_backend = (state["in_pools"])[0:min(MAX_BULK_SIZE,len(state["in_pools"]))]
+
+        backendSetDetails = {"backends":[]}
+        for backend_network_information in state["network_information_list"]:
+            if backend_network_information["ip"] in private_ip_list_for_backend:
+                backendSetDetails["backends"].append({"port": self.port,"targetId":backend_network_information["ip_id"] })
+        log.info("{} - backendSetDetails : {}".format(self.name, str(backendSetDetails)))
+        log.info("{} - starting bulk ({}) update".format(self.name,len(private_ip_list_for_backend)))
+        try:
+            composite_virtual_network_client.update_backend_set_and_wait_for_state(self.id,backendSetDetails, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
+            log.info("{} - finished bulk update".format(self.name))
+        except Exception as e:
+            log.error("{} - error bulk update : {}".format(self.id,e))  
+
+    
+    def sync_diff(self,state):
+        log.info("{} - attaching {} instances".format(self.name,len(state["in_pools_not_registered"])))
+        for backend_network_information in state["network_information_list"]:
+            #ip in private_ip_list_for_backend but not attached -> attach
+            if backend_network_information["ip"] in state["in_pools_not_registered"]:
+                log.info("{} - starting attach {}".format(self.name,backend_network_information["ip"]))
+                create_backend_details = oci.network_load_balancer.models.CreateBackendDetails(target_id = backend_network_information["ip_id"] , port = int(self.port))
+                log.info("create_backend_details : {}".format(str(create_backend_details).replace('\n', '')))
+                try: 
+                    response = composite_virtual_network_client.create_backend_and_wait_for_state(self.id, create_backend_details, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
+                    log.info("{} - finished attach {} : {}".format(self.name,backend_network_information["ip"],response.data.operation_type + " " + response.data.status))
+                except Exception as e:
+                    log.error("{} - error attach : {}".format(self.id,e))
+
+        log.info("{} - detaching {} instances".format(self.name,len(state["registered_not_in_pools"])))
+        # #ip in attached_ip_adresses_list but not private_ip_list_for_backend -> detach
+        for ipaddr in state["registered_not_in_pools"]:
+            log.info("{} - starting detach {} ".format(self.name,ipaddr))
+            try:
+                backend_name = self.backends[ipaddr].target_id + ":" + str(self.backends[ipaddr].port)
+                response = composite_virtual_network_client.delete_backend_and_wait_for_state(self.id,self.backendset_name, backend_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
+                log.info("{} - finished detach {} : {}".format(self.name,ipaddr,response.data.operation_type + " " + response.data.status))
+            except Exception as e:
+                log.error("{} - error attach : {}".format(self.id,e))
+    
+    
 
 class ociInstancePool(object):
     def __init__(self,id,compartment_id):
@@ -91,7 +157,6 @@ class ociInstancePool(object):
         log.info("{} - getting instances".format(self.id))
 
         #get instances for instance pool
-
         instances_list = []
         try:
             list_instance_pool_instances_response = compute_management_client.list_instance_pool_instances(self.compartment_id, self.id)
@@ -112,65 +177,75 @@ class ociInstancePool(object):
 
         #instance-> attachment-> ip
         for instance in self.instances.values():
-            if not instance.net_info_filled():
-                vNIC_attachments.add_compartment(instance.instance.compartment_id)
+            if not instance.network_information_ready():
+                vNIC_attachments.add_compartment(instance.compartment())
                 vnic_attachment = vNIC_attachments.get_vnic_attachment_by_compartment_id_and_instance_id(self.compartment_id,instance.id)
                 if vnic_attachment:
                     instance.add_vnic_attachment(vnic_attachment)
                 else:
                     log.error("{} - no vNIC attachment found".format(instance.id))
     
-    def getPrivateIPs(self):
-        return [instance.privateip_id() for instance in self.instances.values()]
+    def network_information(self):
+        return [instance.network_information() for instance in self.instances.values()]
     
     def getPrivateIPAddresses(self):
-        return [instance.ip_address() for instance in self.instances.values()]
+        return [instance.ip() for instance in self.instances.values()]
 
 class ociInstance(object):
-    def __init__(self,instance_id=None, instance=None,vnic_attachment=None,vnic=None,privateip=None):
+    def __init__(self,instance_id=None,instance_obj=None):
         self.id = instance_id
-        self.instance = instance
-        self.vnic_attachment = vnic_attachment
-        self.vnic = vnic
-        self.privateip = privateip
-        self._privateip_id = ""
-        self._ip_address = ""
+        self.instance_obj = instance_obj
+        self.vnic_attachment_obj = None
+        self.vnic_obj = None
+        self.privateip_obj = None
     
     def add_vnic_attachment(self,vnic_attachment):
-        self.vnic_attachment = vnic_attachment
+        self.vnic_attachment_obj = vnic_attachment
         self.update_network_information()
 
     def update_network_information(self):
-        if self.net_info_filled():
+        if self.network_information_ready():
             return
-
         try:
-            self.vnic = virtual_network_client.get_vnic(self.vnic_attachment.vnic_id).data
-            print("setting ip: {}".format(self.vnic.private_ip))
-            self._ip_address = self.vnic.private_ip
+            self.vnic_obj = virtual_network_client.get_vnic(self.vnic_attachment_obj.vnic_id).data
         except Exception as e:
             log.error("{} - error geting vnic: {}".format(self.id, e))
             return
         
         try:
-            self.privateip = virtual_network_client.list_private_ips( vnic_id=self.vnic.id).data[0]
-            self._privateip_id = self.privateip.id
+            self.privateip_obj = virtual_network_client.list_private_ips( vnic_id=self.vnic_obj.id).data[0]
         except Exception as e:
             log.error("{} - error geting privateip: {}".format(self.id, e))
 
-    def privateip_id(self):
-        return self._privateip_id
+    def network_information(self):
+        ip = ""
+        ip_id = ""
+        instance_id = ""
+        try:
+            ip = self.vnic_obj.private_ip
+            ip_id = self.privateip_obj.id
+            instance_id = self.id
+        except Exception as e:
+            log.error("{} - error geting privateip_info: {}".format(self.id, e))
+        return {"ip": ip,"ip_id":ip_id,"instance_id":instance_id }
     
-    def ip_address(self):
-        return self._ip_address
-    
-    def net_info_filled(self):
-        if self._privateip_id != "" and self._ip_address != "":
-            return True
+    def ip(self):
+        if self.privateip_obj:
+            return self.vnic_obj.private_ip
+        return ""
+
+    def network_information_ready(self):
+        if self.privateip_obj:
+                return True
         return False
+    
+    def compartment(self):
+        if self.instance_obj:
+            return self.instance_obj.compartment_id
+        return ""
 
     def __str__(self):
-        return self.id + " " + str(self._privateip_id)+ " " + str(self._ip_address) #instance.display_name + " " + str(self.id)
+        return self.id + " " + self.privateip_obj.id if self.privateip_obj else "" + " " + self.vnic_obj.private_ip if self.vnic_obj else ""
     
 
 class ociVNICAttachmentPool():
