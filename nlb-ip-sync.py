@@ -12,7 +12,7 @@ MAX_BULK_SIZE = 30
 
 MAX_INTERVAL_SECONDS = 6
 
-waiter_kwargs = {"max_interval_seconds":MAX_INTERVAL_SECONDS}
+
 
  
 
@@ -126,11 +126,7 @@ class ociNLB(object):
                 try: 
                     guard.check()
                     response = composite_virtual_network_client.create_backend_and_wait_for_state(self.id, create_backend_details, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
-                    message = ""
-                    try:
-                        message = response.data.operation_type + " " + response.data.status
-                    except Exception as e:
-                        message = ""
+                    message = "" if type(response) is not oci.response.Response else response.data.operation_type + " " + response.data.status
                     log.info("{} - finished attach {} : {}".format(self.name,backend_network_information["ip"],message))
                 except Exception as e:
                     log.error("{} - error attach : {}".format(self.id,e))
@@ -142,18 +138,15 @@ class ociNLB(object):
             log.info("{} - starting detach {} ".format(self.name,ipaddr))
             try:
                 guard.check()
-                backend_name = self.backends[ipaddr].target_id + ":" + str(self.backends[ipaddr].port)
-                response = composite_virtual_network_client.delete_backend_and_wait_for_state(self.id,self.backendset_name, backend_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
-                message = ""
-                try:
-                    message = response.data.operation_type + " " + response.data.status
-                except Exception as e:
-                    message = ""
+                #backend_name = self.backends[ipaddr].target_id + ":" + str(self.backends[ipaddr].port) #api bug
+                backend_name = self.backends[ipaddr].target_id + "." + str(self.backends[ipaddr].port)
+                log.info("{} - {} ".format(self.name,backend_name))
+                response = composite_virtual_network_client.delete_backend_and_wait_for_state(network_load_balancer_id=self.id,backend_set_name=self.backendset_name,backend_name= backend_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter)
+                message = "" if type(response) is not oci.response.Response else response.data.operation_type + " " + response.data.status
                 log.info("{} - finished detach {} : {}".format(self.name,ipaddr,message))
             except Exception as e:
                 log.error("{} - error attach : {}".format(self.id,e))
                 guard.check(e)
-    
     
 
 class ociInstancePool(object):
@@ -362,7 +355,8 @@ if __name__ == "__main__":
     #logger config
     log = init_log(logging.INFO)
     guard = ociRateErrorGuard()
-    
+    waiter = {"max_interval_seconds":MAX_INTERVAL_SECONDS}
+
     #parser config
     parser = argparse.ArgumentParser()
     parser.add_argument('-ip','--instance-pool',action='append',nargs='+')
