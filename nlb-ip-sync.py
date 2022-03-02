@@ -13,6 +13,7 @@ MAX_BULK_SIZE = 30
 MAX_INTERVAL_SECONDS = 6
 
 waiter_kwargs = {"max_interval_seconds":MAX_INTERVAL_SECONDS}
+
  
 
 class ociNLB(object):
@@ -29,10 +30,12 @@ class ociNLB(object):
         log.info("{} - getting backends".format(self.name))
         backends_list =[]
         try:
+            guard.check()
             list_backends_response = nlb_client.list_backends(self.id, self.backendset_name)
             for ip_address in list_backends_response.data.items:
                 self.backends.setdefault(ip_address.ip_address,ip_address)
                 backends_list.append(ip_address.ip_address)
+                
             
             remove_list = []
             for backend_ip in self.backends.keys():
@@ -43,6 +46,7 @@ class ociNLB(object):
 
         except Exception as e:
             log.error("{} - error getting backends : {}".format(self.id,e))
+            guard.check(e)
     
     def __str__(self):
         return "{} - instance_pools: {}, backends: {}".format(self.id+ ":" + self.backendset_name,str(self.instance_pools),str(list(self.backends.keys())))
@@ -103,10 +107,12 @@ class ociNLB(object):
         log.info("{} - backendSetDetails : {}".format(self.name, str(backendSetDetails)))
         log.info("{} - starting bulk ({}) update".format(self.name,len(private_ip_list_for_backend)))
         try:
+            guard.check()
             composite_virtual_network_client.update_backend_set_and_wait_for_state(self.id,backendSetDetails, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
             log.info("{} - finished bulk update".format(self.name))
         except Exception as e:
-            log.error("{} - error bulk update : {}".format(self.id,e))  
+            log.error("{} - error bulk update : {}".format(self.id,e))
+            guard.check(e)
 
     
     def sync_diff(self,state):
@@ -118,21 +124,35 @@ class ociNLB(object):
                 create_backend_details = oci.network_load_balancer.models.CreateBackendDetails(target_id = backend_network_information["ip_id"] , port = int(self.port))
                 log.info("create_backend_details : {}".format(str(create_backend_details).replace('\n', '')))
                 try: 
+                    guard.check()
                     response = composite_virtual_network_client.create_backend_and_wait_for_state(self.id, create_backend_details, self.backendset_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
-                    log.info("{} - finished attach {} : {}".format(self.name,backend_network_information["ip"],response.data.operation_type + " " + response.data.status))
+                    message = ""
+                    try:
+                        message = response.data.operation_type + " " + response.data.status
+                    except Exception as e:
+                        message = ""
+                    log.info("{} - finished attach {} : {}".format(self.name,backend_network_information["ip"],message))
                 except Exception as e:
                     log.error("{} - error attach : {}".format(self.id,e))
+                    guard.check(e)
 
         log.info("{} - detaching {} instances".format(self.name,len(state["registered_not_in_pools"])))
         # #ip in attached_ip_adresses_list but not private_ip_list_for_backend -> detach
         for ipaddr in state["registered_not_in_pools"]:
             log.info("{} - starting detach {} ".format(self.name,ipaddr))
             try:
+                guard.check()
                 backend_name = self.backends[ipaddr].target_id + ":" + str(self.backends[ipaddr].port)
                 response = composite_virtual_network_client.delete_backend_and_wait_for_state(self.id,self.backendset_name, backend_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
-                log.info("{} - finished detach {} : {}".format(self.name,ipaddr,response.data.operation_type + " " + response.data.status))
+                message = ""
+                try:
+                    message = response.data.operation_type + " " + response.data.status
+                except Exception as e:
+                    message = ""
+                log.info("{} - finished detach {} : {}".format(self.name,ipaddr,message))
             except Exception as e:
                 log.error("{} - error attach : {}".format(self.id,e))
+                guard.check(e)
     
     
 
@@ -159,6 +179,7 @@ class ociInstancePool(object):
         #get instances for instance pool
         instances_list = []
         try:
+            guard.check()
             list_instance_pool_instances_response = compute_management_client.list_instance_pool_instances(self.compartment_id, self.id)
             for instance in list_instance_pool_instances_response.data:
                 if instance.state == "Running":
@@ -166,6 +187,7 @@ class ociInstancePool(object):
                     instances_list.append(instance.id)
         except Exception as e:
             log.error("{} - error getting instances : {}".format(self.id,e))
+            guard.check(e)
         
         #remove terminated
         remove_list = []
@@ -207,15 +229,19 @@ class ociInstance(object):
         if self.network_information_ready():
             return
         try:
+            guard.check()
             self.vnic_obj = virtual_network_client.get_vnic(self.vnic_attachment_obj.vnic_id).data
         except Exception as e:
             log.error("{} - error geting vnic: {}".format(self.id, e))
+            guard.check(e)
             return
         
         try:
+            guard.check()
             self.privateip_obj = virtual_network_client.list_private_ips( vnic_id=self.vnic_obj.id).data[0]
         except Exception as e:
             log.error("{} - error geting privateip: {}".format(self.id, e))
+            guard.check(e)
 
     def network_information(self):
         ip = ""
@@ -266,16 +292,58 @@ class ociVNICAttachmentPool():
         for compartment_id in compartment_ids_list:
             log.info("{} - getting vNIC attachments information".format(compartment_id))
             try:
+                guard.check()
                 list_vnic_attachments_response = oci.pagination.list_call_get_all_results(compute_client.list_vnic_attachments, compartment_id)
                 for vnic_attachment in list_vnic_attachments_response.data:
                     (self.compartments[compartment_id]).setdefault(vnic_attachment.instance_id,vnic_attachment)
             except Exception as e:
                 log.error("{} - error getting vNIC attachments: {}".format(self.compartment_id,e))
+                guard.check(e)
     
     def get_vnic_attachment_by_compartment_id_and_instance_id(self,compartment_id,instance_id):        
         return (self.compartments[compartment_id])[instance_id]
 
-            
+
+class ociRateErrorGuard(object):
+    def __init__(self):
+        self.base_wait = 0.001
+        self.decrease_rate = 0.75
+        self.wait_rate = 1
+        self.increase_rate = 2
+        self.cool_period = 60 #60 =1 minute
+        self.now = 0
+
+    def set_now(self):
+        self.now = int(time.time())
+
+    def _wait_time_value(self):
+        return self.base_wait*self.wait_rate
+
+    def _wait(self):
+        #if during last minute no rate issues reduce wait by step_down
+        if int(time.time()) - self.now > self.cool_period:
+            self.set_now()
+            new_wait = max(1, round(self.wait_rate*self.decrease_rate,3))
+            if(new_wait < self.wait_rate):
+                self.wait_rate = new_wait
+                log.error("RateGuard - guard time decreased to {}".format(self._wait_time_value()))
+        time.sleep(self._wait_time_value())
+    
+    def check(self,exception=None): 
+        if exception:
+            try:
+                if int(exception.status) == 429: #exception.code=TooManyRequests
+                    self.wait_rate = round(self.wait_rate*self.increase_rate,3)
+                    self.set_now()
+                    log.error("RateGuard - guard time increased to {}".format(self._wait_time_value()))
+            except Exception as e:
+                log.error("RateGuard - error : {}".format(e))
+
+        #always wait for some time
+        self._wait()
+    
+
+
 
 def init_log(logLevel = logging.INFO):
     log = logging.getLogger('IPtoNLB')
@@ -292,7 +360,8 @@ def init_log(logLevel = logging.INFO):
 
 if __name__ == "__main__":
     #logger config
-    log = init_log(logging.INFO)
+    log = init_log(logging.ERROR)
+    guard = ociRateErrorGuard()
     
     #parser config
     parser = argparse.ArgumentParser()
@@ -345,7 +414,7 @@ if __name__ == "__main__":
 
     vNIC_attachments = ociVNICAttachmentPool()
 
-    default_sleep = 3
+
     while(True):
 
         #refresh each iteration
@@ -353,23 +422,22 @@ if __name__ == "__main__":
 
         #refresh each iteration
         vNIC_attachments.updateVNICAttachments()
-        time.sleep(default_sleep)
+       
 
         #refresh instances information for each instance pool
         for ip in ip_dict.values():
             ip.getInstances()
             log.info(ip.full())
-            time.sleep(default_sleep)
+            
         
         #refresh NLB information for each NLB
         for nlb in nlb_dict.values():
             nlb.getBackends()
             log.info(str(nlb))
-            time.sleep(default_sleep)
-        
+            
         #sync each NLB
         for nlb in nlb_dict.values():
             nlb.sync()
-            time.sleep(default_sleep)
+            
         
 
