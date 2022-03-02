@@ -116,10 +116,11 @@ class ociNLB(object):
 
     
     def sync_diff(self,state):
-        log.info("{} - attaching {} instances".format(self.name,len(state["in_pools_not_registered"])))
+        private_ip_list_for_backend = (state["in_pools_not_registered"])[0:min(MAX_BULK_SIZE,len(state["in_pools_not_registered"]))] #limit bulk size to MAX_BULK_SIZE
+        log.info("{} - attaching {} instances".format(self.name,len(private_ip_list_for_backend)))
         for backend_network_information in state["network_information_list"]:
             #ip in private_ip_list_for_backend but not attached -> attach
-            if backend_network_information["ip"] in state["in_pools_not_registered"]:
+            if backend_network_information["ip"] in private_ip_list_for_backend:
                 log.info("{} - starting attach {}".format(self.name,backend_network_information["ip"]))
                 create_backend_details = oci.network_load_balancer.models.CreateBackendDetails(target_id = backend_network_information["ip_id"] , port = int(self.port))
                 log.info("create_backend_details : {}".format(str(create_backend_details).replace('\n', '')))
@@ -132,17 +133,25 @@ class ociNLB(object):
                     log.error("{} - error attach : {}".format(self.id,e))
                     guard.check(e)
 
-        log.info("{} - detaching {} instances".format(self.name,len(state["registered_not_in_pools"])))
+        private_ip_list_remove_from_backend = (state["registered_not_in_pools"])[0:min(MAX_BULK_SIZE,len(state["registered_not_in_pools"]))] #limit bulk size to MAX_BULK_SIZE
+        log.info("{} - detaching {} instances".format(self.name,len(private_ip_list_remove_from_backend)))
         # #ip in attached_ip_adresses_list but not private_ip_list_for_backend -> detach
-        for ipaddr in state["registered_not_in_pools"]:
+        for ipaddr in private_ip_list_remove_from_backend:
             log.info("{} - starting detach {} ".format(self.name,ipaddr))
             try:
                 guard.check()
+                message = ""
                 #backend_name = self.backends[ipaddr].target_id + ":" + str(self.backends[ipaddr].port) #api bug
                 backend_name = self.backends[ipaddr].target_id + "." + str(self.backends[ipaddr].port)
-                log.info("{} - {} ".format(self.name,backend_name))
-                response = composite_virtual_network_client.delete_backend_and_wait_for_state(network_load_balancer_id=self.id,backend_set_name=self.backendset_name,backend_name= backend_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter)
-                message = "" if type(response) is not oci.response.Response else response.data.operation_type + " " + response.data.status
+                #log.info("{} - {} ".format(self.name,backend_name))
+                response = composite_virtual_network_client.delete_backend_and_wait_for_state(network_load_balancer_id=self.id,backend_set_name=self.backendset_name,backend_name= backend_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
+                if type(response) is oci.response.Response:
+                     message = message + " " + response.data.operation_type + " " + response.data.status
+                guard.check()
+                backend_name = self.backends[ipaddr].target_id + ":" + str(self.backends[ipaddr].port)
+                response = composite_virtual_network_client.delete_backend_and_wait_for_state(network_load_balancer_id=self.id,backend_set_name=self.backendset_name,backend_name= backend_name, wait_for_states=["ACTIVE","SUCCEEDED","FAILED"],waiter_kwargs=waiter_kwargs)
+                if type(response) is oci.response.Response:
+                     message = message + " " + response.data.operation_type + " " + response.data.status
                 log.info("{} - finished detach {} : {}".format(self.name,ipaddr,message))
             except Exception as e:
                 log.error("{} - error attach : {}".format(self.id,e))
@@ -355,7 +364,7 @@ if __name__ == "__main__":
     #logger config
     log = init_log(logging.INFO)
     guard = ociRateErrorGuard()
-    waiter = {"max_interval_seconds":MAX_INTERVAL_SECONDS}
+    waiter_kwargs = {"max_interval_seconds":MAX_INTERVAL_SECONDS}
 
     #parser config
     parser = argparse.ArgumentParser()
