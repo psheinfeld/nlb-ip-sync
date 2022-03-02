@@ -360,7 +360,7 @@ def init_log(logLevel = logging.INFO):
 
 if __name__ == "__main__":
     #logger config
-    log = init_log(logging.ERROR)
+    log = init_log(logging.INFO)
     guard = ociRateErrorGuard()
     
     #parser config
