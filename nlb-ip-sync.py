@@ -32,7 +32,7 @@ class ociNLB(object):
             response = nlb_client.list_backends(self.id, self.backendset_name)
             responce_backends_list = response.data.items
             while response.has_next_page:
-                log.info("{} - getting backends - pulling additional page".format(self.name))
+                #log.info("{} - getting backends - pulling additional page".format(self.name))
                 guard.check()
                 response = nlb_client.list_backends(self.id, self.backendset_name,page=response.next_page)
                 responce_backends_list = responce_backends_list + response.data.items
@@ -193,12 +193,17 @@ class ociInstancePool(object):
         instances_list = []
         try:
             guard.check()
-            list_instance_pool_instances_response = compute_management_client.list_instance_pool_instances(self.compartment_id, self.id)
-            for instance in list_instance_pool_instances_response.data:
+            response = compute_management_client.list_instance_pool_instances(self.compartment_id, self.id)
+            list_instance_pool_instances_response = response.data
+            while response.has_next_page:
+                guard.check()
+                response = compute_management_client.list_instance_pool_instances(self.compartment_id, self.id,page=response.next_page)
+                list_instance_pool_instances_response = list_instance_pool_instances_response + response.data          
+            for instance in list_instance_pool_instances_response:
                 if instance.state == "Running":
                     self.instances.setdefault(instance.id,ociInstance(instance.id,instance))
                     instances_list.append(instance.id)
-            log.info("{} - got {} running instances".format(self.id,len(list_instance_pool_instances_response.data)))
+            log.info("{} - got {} running instances".format(self.id,len(list_instance_pool_instances_response)))
         except Exception as e:
             log.error("{} - error getting instances : {}".format(self.id,e))
             guard.check(e)
