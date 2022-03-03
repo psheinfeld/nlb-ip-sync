@@ -9,11 +9,8 @@ from oci.core import ComputeManagementClient
 from oci.network_load_balancer import NetworkLoadBalancerClient ,NetworkLoadBalancerClientCompositeOperations
 
 MAX_BULK_SIZE = 30
-
+MAX_OPERATION_SIZE = 20
 MAX_INTERVAL_SECONDS = 6
-
-
-
  
 
 class ociNLB(object):
@@ -29,27 +26,43 @@ class ociNLB(object):
     def getBackends(self):
         log.info("{} - getting backends".format(self.name))
         backends_list =[]
+        
         try:
             guard.check()
-            list_backends_response = nlb_client.list_backends(self.id, self.backendset_name)
-            for ip_address in list_backends_response.data.items:
-                self.backends.setdefault(ip_address.ip_address,ip_address)
-                backends_list.append(ip_address.ip_address)
-                
-            
+            response = nlb_client.list_backends(self.id, self.backendset_name)
+            responce_backends_list = response.data.items
+            while response.has_next_page:
+                log.info("{} - getting backends - pulling additional page".format(self.name))
+                guard.check()
+                response = nlb_client.list_backends(self.id, self.backendset_name,page=response.next_page)
+                responce_backends_list = responce_backends_list + response.data.items
+
+            for ip_address in responce_backends_list:
+                if type(ip_address) is oci.network_load_balancer.models.backend_summary.BackendSummary:
+                    self.backends.setdefault(ip_address.ip_address,ip_address)
+                    backends_list.append(ip_address.ip_address)
+                else:
+                    log.error("{} - backend error : {}".format(self.id,str(ip_address)))
+
+            #update cached data
             remove_list = []
             for backend_ip in self.backends.keys():
                 if backend_ip not in backends_list:
                     remove_list.append(backend_ip)
             for backend_ip in remove_list:
                 del self.backends[backend_ip]
+            
+            log.info("{} - got {} backends".format(self.name,len(self.backends.keys())))
 
         except Exception as e:
             log.error("{} - error getting backends : {}".format(self.id,e))
             guard.check(e)
     
+
+    
+
     def __str__(self):
-        return "{} - instance_pools: {}, backends: {}".format(self.id+ ":" + self.backendset_name,str(self.instance_pools),str(list(self.backends.keys())))
+        return "{} - instance_pools: ({}) {}, backends: ({}) {}".format(self.id + ":" + self.backendset_name,len(self.instance_pools),str(self.instance_pools),len(list(self.backends.keys())),str(list(self.backends.keys())))
         
     
     def sync_state(self):
@@ -116,7 +129,7 @@ class ociNLB(object):
 
     
     def sync_diff(self,state):
-        private_ip_list_for_backend = (state["in_pools_not_registered"])[0:min(MAX_BULK_SIZE,len(state["in_pools_not_registered"]))] #limit bulk size to MAX_BULK_SIZE
+        private_ip_list_for_backend = (state["in_pools_not_registered"])[0:min(MAX_OPERATION_SIZE,len(state["in_pools_not_registered"]))] #limit bulk size to MAX_OPERATION_SIZE
         log.info("{} - attaching {} instances".format(self.name,len(private_ip_list_for_backend)))
         for backend_network_information in state["network_information_list"]:
             #ip in private_ip_list_for_backend but not attached -> attach
@@ -133,7 +146,7 @@ class ociNLB(object):
                     log.error("{} - error attach : {}".format(self.id,e))
                     guard.check(e)
 
-        private_ip_list_remove_from_backend = (state["registered_not_in_pools"])[0:min(MAX_BULK_SIZE,len(state["registered_not_in_pools"]))] #limit bulk size to MAX_BULK_SIZE
+        private_ip_list_remove_from_backend = (state["registered_not_in_pools"])[0:min(MAX_OPERATION_SIZE,len(state["registered_not_in_pools"]))] #limit bulk size to MAX_OPERATION_SIZE
         log.info("{} - detaching {} instances".format(self.name,len(private_ip_list_remove_from_backend)))
         # #ip in attached_ip_adresses_list but not private_ip_list_for_backend -> detach
         for ipaddr in private_ip_list_remove_from_backend:
@@ -166,7 +179,7 @@ class ociInstancePool(object):
         
     
     def __str__(self):
-        return self.id + " : " +  str(list(self.instances.keys()))
+        return self.id + " : " + str(len(list(self.instances.keys())))
     
     def full(self):
         output =  "{} - ({}) ".format(self.id, len(self.instances.keys()) )
@@ -175,9 +188,7 @@ class ociInstancePool(object):
         return output
 
     def getInstances(self):
-
         log.info("{} - getting instances".format(self.id))
-
         #get instances for instance pool
         instances_list = []
         try:
@@ -187,6 +198,7 @@ class ociInstancePool(object):
                 if instance.state == "Running":
                     self.instances.setdefault(instance.id,ociInstance(instance.id,instance))
                     instances_list.append(instance.id)
+            log.info("{} - got {} running instances".format(self.id,len(list_instance_pool_instances_response.data)))
         except Exception as e:
             log.error("{} - error getting instances : {}".format(self.id,e))
             guard.check(e)
@@ -287,7 +299,6 @@ class ociVNICAttachmentPool():
             self.updateVNICAttachments(compartment_id)
 
     def updateVNICAttachments(self,compartment_id=None):
-        
         compartment_ids_list = [compartment_id] if compartment_id else self.compartments.keys()
         if len(compartment_ids_list) == 0:
             return
@@ -298,6 +309,7 @@ class ociVNICAttachmentPool():
                 list_vnic_attachments_response = oci.pagination.list_call_get_all_results(compute_client.list_vnic_attachments, compartment_id)
                 for vnic_attachment in list_vnic_attachments_response.data:
                     (self.compartments[compartment_id]).setdefault(vnic_attachment.instance_id,vnic_attachment)
+                log.info("{} - got {} vNIC attachments".format(compartment_id,len(list_vnic_attachments_response.data)))
             except Exception as e:
                 log.error("{} - error getting vNIC attachments: {}".format(self.compartment_id,e))
                 guard.check(e)
@@ -430,13 +442,13 @@ if __name__ == "__main__":
         #refresh instances information for each instance pool
         for ip in ip_dict.values():
             ip.getInstances()
-            log.info(ip.full())
+            #log.info(ip)
             
         
         #refresh NLB information for each NLB
         for nlb in nlb_dict.values():
             nlb.getBackends()
-            log.info(str(nlb))
+            #log.info(str(nlb))
             
         #sync each NLB
         for nlb in nlb_dict.values():
