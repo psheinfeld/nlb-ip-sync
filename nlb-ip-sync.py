@@ -7,10 +7,16 @@ from collections import defaultdict
 import collections
 from oci.core import ComputeManagementClient 
 from oci.network_load_balancer import NetworkLoadBalancerClient ,NetworkLoadBalancerClientCompositeOperations
+import os
 
+#default value for max size of bulk update operation
 MAX_BULK_SIZE = 30
-MAX_OPERATION_SIZE = 20
+#default value for max size of sequenced update operation
+MAX_OPERATION_SIZE = 10
+#default value for waiter query interval in OCI composite operations 
 MAX_INTERVAL_SECONDS = 6
+#default log level
+LOG_LEVEL = "DEBUG"
  
 
 class ociNLB(object):
@@ -24,6 +30,11 @@ class ociNLB(object):
         self.name=self.id + ":" + self.backendset_name + ":" + self.port 
     
     def getBackends(self):
+        completed = False
+        while not completed:
+            completed = self._getBackends()
+
+    def _getBackends(self):
         log.info("{} - getting backends".format(self.name))
         backends_list =[]
         
@@ -53,10 +64,12 @@ class ociNLB(object):
                 del self.backends[backend_ip]
             
             log.info("{} - got {} backends".format(self.name,len(self.backends.keys())))
+            return True
 
         except Exception as e:
             log.error("{} - error getting backends : {}".format(self.id,e))
             guard.check(e)
+            return False
     
 
     
@@ -77,8 +90,12 @@ class ociNLB(object):
             in_pools_not_registered = list(set(private_ip_adresses_list_for_backend) - set(actual_ip_adresses_list))
             registered_not_in_pools = list(set(actual_ip_adresses_list) - set(private_ip_adresses_list_for_backend))
         
-            log.info("{} - backends in pools ({}) : {}".format(self.name, len(private_ip_adresses_list_for_backend),private_ip_adresses_list_for_backend))
-            log.info("{} - backends registered ({}) : {}".format(self.name,len(actual_ip_adresses_list),actual_ip_adresses_list))
+            log.info("{} - backends in pools : {}".format(self.name, len(private_ip_adresses_list_for_backend)))
+            log.debug("{} - backends in pools : {}".format(self.name,private_ip_adresses_list_for_backend))
+
+            log.info("{} - backends registered : {}".format(self.name,len(actual_ip_adresses_list)))
+            log.debug("{} - backends registered : {}".format(self.name,actual_ip_adresses_list))
+
             log.info("{} - backends in pools not registered ({}) : {}".format(self.name,len(in_pools_not_registered),in_pools_not_registered))
             log.info("{} - backends registered not in pools ({}) : {}".format(self.name,len(registered_not_in_pools),registered_not_in_pools))
 
@@ -111,7 +128,7 @@ class ociNLB(object):
 
     #updates whole backend set - fast but disruptive - since all nodes considered new, health check will delay actual add to operation
     def sync_full(self,state):
-        private_ip_list_for_backend = (state["in_pools"])[0:min(MAX_BULK_SIZE,len(state["in_pools"]))]
+        private_ip_list_for_backend = (state["in_pools"])[0:min(value_max_bulk_size,len(state["in_pools"]))]
 
         backendSetDetails = {"backends":[]}
         for backend_network_information in state["network_information_list"]:
@@ -127,9 +144,12 @@ class ociNLB(object):
             log.error("{} - error bulk update : {}".format(self.id,e))
             guard.check(e)
 
-    
     def sync_diff(self,state):
-        private_ip_list_for_backend = (state["in_pools_not_registered"])[0:min(MAX_OPERATION_SIZE,len(state["in_pools_not_registered"]))] #limit bulk size to MAX_OPERATION_SIZE
+        self.sync_diff_attach(state)
+        self.sync_diff_dettach(state)
+    
+    def sync_diff_attach(self,state):
+        private_ip_list_for_backend = (state["in_pools_not_registered"])[0:min(value_max_operation_size,len(state["in_pools_not_registered"]))] #limit bulk size to MAX_OPERATION_SIZE
         log.info("{} - attaching {} instances".format(self.name,len(private_ip_list_for_backend)))
         for backend_network_information in state["network_information_list"]:
             #ip in private_ip_list_for_backend but not attached -> attach
@@ -145,8 +165,9 @@ class ociNLB(object):
                 except Exception as e:
                     log.error("{} - error attach : {}".format(self.id,e))
                     guard.check(e)
-
-        private_ip_list_remove_from_backend = (state["registered_not_in_pools"])[0:min(MAX_OPERATION_SIZE,len(state["registered_not_in_pools"]))] #limit bulk size to MAX_OPERATION_SIZE
+        
+    def sync_diff_dettach(self,state):
+        private_ip_list_remove_from_backend = (state["registered_not_in_pools"])[0:min(value_max_operation_size,len(state["registered_not_in_pools"]))] #limit bulk size to MAX_OPERATION_SIZE
         log.info("{} - detaching {} instances".format(self.name,len(private_ip_list_remove_from_backend)))
         # #ip in attached_ip_adresses_list but not private_ip_list_for_backend -> detach
         for ipaddr in private_ip_list_remove_from_backend:
@@ -188,6 +209,11 @@ class ociInstancePool(object):
         return output
 
     def getInstances(self):
+        completed = False
+        while not completed:
+            completed = self._getInstances()
+
+    def _getInstances(self):
         log.info("{} - getting instances".format(self.id))
         #get instances for instance pool
         instances_list = []
@@ -207,6 +233,7 @@ class ociInstancePool(object):
         except Exception as e:
             log.error("{} - error getting instances : {}".format(self.id,e))
             guard.check(e)
+            return False
         
         #remove terminated
         remove_list = []
@@ -225,6 +252,7 @@ class ociInstancePool(object):
                     instance.add_vnic_attachment(vnic_attachment)
                 else:
                     log.error("{} - no vNIC attachment found".format(instance.id))
+        return True
     
     def network_information(self):
         return [instance.network_information() for instance in self.instances.values()]
@@ -304,9 +332,14 @@ class ociVNICAttachmentPool():
             self.updateVNICAttachments(compartment_id)
 
     def updateVNICAttachments(self,compartment_id=None):
+        completed = False
+        while not completed:
+            completed = self._updateVNICAttachments(compartment_id)
+
+    def _updateVNICAttachments(self,compartment_id=None):
         compartment_ids_list = [compartment_id] if compartment_id else self.compartments.keys()
         if len(compartment_ids_list) == 0:
-            return
+            return True
         for compartment_id in compartment_ids_list:
             log.info("{} - getting vNIC attachments information".format(compartment_id))
             try:
@@ -315,9 +348,11 @@ class ociVNICAttachmentPool():
                 for vnic_attachment in list_vnic_attachments_response.data:
                     (self.compartments[compartment_id]).setdefault(vnic_attachment.instance_id,vnic_attachment)
                 log.info("{} - got {} vNIC attachments".format(compartment_id,len(list_vnic_attachments_response.data)))
+                return True
             except Exception as e:
                 log.error("{} - error getting vNIC attachments: {}".format(self.compartment_id,e))
                 guard.check(e)
+                return False
     
     def get_vnic_attachment_by_compartment_id_and_instance_id(self,compartment_id,instance_id):        
         return (self.compartments[compartment_id])[instance_id]
@@ -364,7 +399,7 @@ class ociRateErrorGuard(object):
 
 
 
-def init_log(logLevel = logging.INFO):
+def init_log(logLevel):
     log = logging.getLogger('IPtoNLB')
     log.setLevel(logLevel)
     ch = logging.StreamHandler()
@@ -378,10 +413,20 @@ def init_log(logLevel = logging.INFO):
 
 
 if __name__ == "__main__":
+    #environment variables
+    value_max_interval_seconds = os.getenv('NLBIP_MAX_INTERVAL_SECONDS', MAX_INTERVAL_SECONDS)
+    value_max_bulk_size = os.getenv('NLBIP_MAX_BULK_SIZE', MAX_BULK_SIZE)
+    value_max_operation_size = os.getenv('NLBIP_MAX_OPERATION_SIZE', MAX_OPERATION_SIZE)
+    value_log_level = os.getenv('NLBIP_LOG_LEVEL', LOG_LEVEL)
+
     #logger config
-    log = init_log(logging.INFO)
+    numeric_log_level = getattr(logging, value_log_level.upper(), LOG_LEVEL)
+    if not isinstance(numeric_log_level, int):
+        raise ValueError('Invalid log level: %s' % value_log_level)
+    log = init_log(numeric_log_level)
+    log.info("Logging level : {}".format(value_log_level))
     guard = ociRateErrorGuard()
-    waiter_kwargs = {"max_interval_seconds":MAX_INTERVAL_SECONDS}
+    waiter_kwargs = {"max_interval_seconds":value_max_interval_seconds}
 
     #parser config
     parser = argparse.ArgumentParser()
