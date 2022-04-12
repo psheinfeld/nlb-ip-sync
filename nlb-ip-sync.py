@@ -10,7 +10,7 @@ from oci.network_load_balancer import NetworkLoadBalancerClient ,NetworkLoadBala
 import os
 
 #default value for max size of bulk update operation
-MAX_BULK_SIZE = 30
+MAX_BULK_SIZE = 300
 #default value for max size of sequenced update operation
 MAX_OPERATION_SIZE = 10
 #default value for waiter query interval in OCI composite operations 
@@ -414,10 +414,15 @@ def init_log(logLevel):
 
 if __name__ == "__main__":
     #environment variables
-    value_max_interval_seconds = os.getenv('NLBIP_MAX_INTERVAL_SECONDS', MAX_INTERVAL_SECONDS)
-    value_max_bulk_size = os.getenv('NLBIP_MAX_BULK_SIZE', MAX_BULK_SIZE)
-    value_max_operation_size = os.getenv('NLBIP_MAX_OPERATION_SIZE', MAX_OPERATION_SIZE)
-    value_log_level = os.getenv('NLBIP_LOG_LEVEL', LOG_LEVEL)
+    try:
+        value_max_interval_seconds = int(os.getenv('NLBIP_MAX_INTERVAL_SECONDS', MAX_INTERVAL_SECONDS))
+        value_max_bulk_size = int(os.getenv('NLBIP_MAX_BULK_SIZE', MAX_BULK_SIZE))
+        value_max_operation_size = int(os.getenv('NLBIP_MAX_OPERATION_SIZE', MAX_OPERATION_SIZE))
+        value_log_level = os.getenv('NLBIP_LOG_LEVEL', LOG_LEVEL)
+    except Exception as e:
+        print("environment variables read error : {}".format(e))
+        exit()
+    
 
     #logger config
     numeric_log_level = getattr(logging, value_log_level.upper(), LOG_LEVEL)
@@ -427,6 +432,11 @@ if __name__ == "__main__":
     log.info("Logging level : {}".format(value_log_level))
     guard = ociRateErrorGuard()
     waiter_kwargs = {"max_interval_seconds":value_max_interval_seconds}
+
+    log.info("max_interval_seconds : {}".format(value_max_interval_seconds))
+    log.info("max_bulk_size : {}".format(value_max_bulk_size))
+    log.info("max_operation_size : {}".format(value_max_operation_size))
+    log.info("log_level : {}".format(value_log_level))
 
     #parser config
     parser = argparse.ArgumentParser()
